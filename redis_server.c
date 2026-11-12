@@ -147,7 +147,6 @@ int main(void){
         //graceful shutdown
         memset(read_buf, 0, sizeof(read_buf));
         shutdown(accept_fd, SHUT_WR);
-        memset(buf, 0, sizeof(buf));
         while(read(accept_fd, read_buf, sizeof(read_buf)-1) != 0);
         close(accept_fd);
     }
