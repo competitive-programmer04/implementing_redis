@@ -19,7 +19,7 @@ int read_message(int fd, char *buf, size_t size){
     errno = 0;
     while(size > 0){
         num_read = read(fd, buf, size);
-        if(num_read <= 0){
+        if(num_read < 0 && errno != EINTR){
             return -1;
         }
         size = size - num_read;
@@ -32,7 +32,7 @@ int write_message(int fd, const char *buf, size_t size){
     ssize_t num_write = 0;
 while(size > 0){
         num_write = write(fd, buf, size);
-        if(num_write < 0){
+        if(num_write < 0 && errno != EINTR){
             return -1;
         }
         size = size - num_write;
