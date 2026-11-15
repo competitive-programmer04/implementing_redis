@@ -8,18 +8,29 @@
 #include<arpa/inet.h>
 #include<netinet/in.h>
 #include<errno.h>
+/*#include<fcntl.h>*/
+#include<signal.h>
 
 #define MAX_MSG_LEN 4096
 #define HEADER_LEN 4
 #define BACKLOG 10
 const char *PORT = "3000";
 
+volatile sig_atomic_t stop_flag = 0;
+
+void handle_signal(int sig){
+    if(sig == SIGINT || sig == SIGTERM){
+        stop_flag = 1;
+    }
+    return;
+}
+
 int read_message(int fd, char *buf, size_t size){
     ssize_t num_read = 0;
     errno = 0;
     while(size > 0){
         num_read = read(fd, buf, size);
-        if(num_read < 0 && errno != EINTR){
+        if(num_read < 0 && errno != EINTR /* && errno != EAGAIN && errno != EWOULDBLOCK*/){
             return -1;
         }
         size = size - num_read;
@@ -32,7 +43,7 @@ int write_message(int fd, const char *buf, size_t size){
     ssize_t num_write = 0;
 while(size > 0){
         num_write = write(fd, buf, size);
-        if(num_write < 0 && errno != EINTR){
+        if(num_write < 0 && errno != EINTR /*&& errno != EAGAIN && errno != EWOULDBLOCK*/){
             return -1;
         }
         size = size - num_write;
@@ -42,6 +53,7 @@ while(size > 0){
 }
 
 int main(void){
+    struct sigaction sa;
     int status = 0;
     struct addrinfo a_info;
     struct addrinfo *head;
@@ -81,12 +93,22 @@ int main(void){
      first 4 bytes will indicate the payload length
      then the next bytes will contain the payload
      */
-    while(1){
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    // Register handle for both Ctrl-C and termination request
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    while(!stop_flag){
         struct sockaddr_storage ss;
         socklen_t size = sizeof(ss);
         int accept_fd = accept(lis_fd, (struct sockaddr*)&ss, &size);
         if(accept_fd == -1){
-        perror("accept");
+            if(errno != EINTR){
+                perror("accept");
+            }
+            continue;
         }
         char buf[256];
         memset(buf, 0, sizeof(buf));
@@ -102,6 +124,15 @@ int main(void){
             buf[255] = '\0';
             fprintf(stdout, "The ip address of client is %s and port number is %d\n", buf, my_addr6->sin6_port);
         }
+        /*
+        int flags = fcntl(accept_fd, F_GETFL);
+        flags = flags | O_NONBLOCK;
+        if(fcntl(accept_fd, F_SETFL, flags) == -1){
+            perror("fcntl");
+            close(accept_fd);
+            continue;
+        }
+        */
         char read_buf[HEADER_LEN + MAX_MSG_LEN];
         char write_buf[HEADER_LEN + MAX_MSG_LEN];
         memset(read_buf, 0, sizeof(read_buf));
@@ -150,6 +181,7 @@ int main(void){
         while(read(accept_fd, read_buf, sizeof(read_buf)-1) != 0);
         close(accept_fd);
     }
+    printf("user pressed Ctrl-C\n");
     close(lis_fd);
     return EXIT_SUCCESS;
 }

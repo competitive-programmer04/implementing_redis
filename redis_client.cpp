@@ -8,6 +8,7 @@
 #include<arpa/inet.h>
 #include<netinet/in.h>
 #include<errno.h>
+/*#include<fcntl.h>*/
 
 #define HEADER_LEN 4
 #define MAX_MSG_LEN 4096
@@ -18,7 +19,7 @@ int read_message(int fd, char *buf, size_t size){
     errno = 0;
     while(size > 0){
         num_read = read(fd, buf, size);
-        if(num_read < 0 && errno != EINTR){
+        if(num_read < 0 && errno != EINTR /*&& errno != EAGAIN && errno != EWOULDBLOCK*/){
             return -1;
         }
         size = size - num_read;
@@ -32,7 +33,7 @@ int write_message(int fd, const char *buf, size_t size){
     ssize_t num_write = 0;
     while(size > 0){
         num_write = write(fd, buf, size);
-        if(num_write < 0 && errno != EINTR){
+        if(num_write < 0 && errno != EINTR /*&& errno != EAGAIN && errno != EWOULDBLOCK*/){
             return -1;
         }
         size = size - num_write;
@@ -57,6 +58,15 @@ int main(void){
         close(client_fd);
         return EXIT_FAILURE;
     }
+    /*
+    int flags = fcntl(client_fd, F_GETFL);
+    flags = flags | O_NONBLOCK;
+    if(fcntl(client_fd, F_SETFL, flags) == -1){
+        perror("fnctl");
+        close(client_fd);
+        return EXIT_FAILURE;
+    }
+    */
     /* Message Structure
      first 4 bytes will indicate the payload length
      then the next bytes will contain the payload

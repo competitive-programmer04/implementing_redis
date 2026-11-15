@@ -1,10 +1,10 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -Werror -std=c99 -D_DEFAULT_SOURCE -D_C_POSIX_SOURCE=200112
+CXX = gcc
+CXXFLAGS = -Wall -Wextra -Werror -std=c++17 -g 
 
 TARGET_FILE1 = redis_server
 TARGET_FILE2 = redis_client
-SRCS_FILE1 = redis_server.c
-SRCS_FILE2 = redis_client.c
+SRCS_FILE1 = redis_server.cpp
+SRCS_FILE2 = redis_client.cpp
 
 all: $(TARGET_FILE1) $(TARGET_FILE2)
 
