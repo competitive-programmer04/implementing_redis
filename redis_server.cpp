@@ -8,13 +8,24 @@
 #include<arpa/inet.h>
 #include<netinet/in.h>
 #include<errno.h>
-/*#include<fcntl.h>*/
+#include<fcntl.h>
 #include<signal.h>
+#include<sys/epoll.h>
 
 #define MAX_MSG_LEN 4096
 #define HEADER_LEN 4
 #define BACKLOG 10
+#define MAX_EVENTS 1024
 const char *PORT = "3000";
+char my_buf[MAX_MSG_LEN];
+
+typedef struct Connection{
+    int fd;
+    char *read_buf;
+    ssize_t read_len;
+    char *write_buf;
+    ssize_t write_len;
+}Connection;
 
 volatile sig_atomic_t stop_flag = 0;
 
@@ -25,12 +36,24 @@ void handle_signal(int sig){
     return;
 }
 
+void set_non_block(int fd){
+    int flags = fcntl(fd, F_GETFL, 0);
+    if(flags == -1){
+        perror("fcntl");
+        exit(1);
+    }
+    flags = flags | O_NONBLOCK;
+    fcntl(fd, F_SETFL, flags);
+    return;
+}
+
+/*
 int read_message(int fd, char *buf, size_t size){
     ssize_t num_read = 0;
     errno = 0;
     while(size > 0){
         num_read = read(fd, buf, size);
-        if(num_read < 0 && errno != EINTR /* && errno != EAGAIN && errno != EWOULDBLOCK*/){
+        if(num_read < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
             return -1;
         }
         size = size - num_read;
@@ -43,7 +66,7 @@ int write_message(int fd, const char *buf, size_t size){
     ssize_t num_write = 0;
 while(size > 0){
         num_write = write(fd, buf, size);
-        if(num_write < 0 && errno != EINTR /*&& errno != EAGAIN && errno != EWOULDBLOCK*/){
+        if(num_write < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
             return -1;
         }
         size = size - num_write;
@@ -51,8 +74,11 @@ while(size > 0){
     }
     return 0;
 }
+*/
 
 int main(void){
+    memset(my_buf, 0, MAX_MSG_LEN);
+    my_buf[MAX_MSG_LEN-1] = '\0';
     struct sigaction sa;
     int status = 0;
     struct addrinfo a_info;
@@ -89,6 +115,7 @@ int main(void){
         return EXIT_FAILURE;
     }
     fprintf(stdout, "server started at port %s\n", PORT);
+    set_non_block(lis_fd);
     /* Message Structure
      first 4 bytes will indicate the payload length
      then the next bytes will contain the payload
@@ -100,6 +127,143 @@ int main(void){
     // Register handle for both Ctrl-C and termination request
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    // creating epoll instance
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if(epfd == -1){
+        perror("epoll");
+        return EXIT_FAILURE;
+    }
+    // adding the fd to the red-black tree of epoll instance
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = lis_fd;
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, lis_fd, &ev) == -1){
+        perror("epoll_ctl");
+        return EXIT_FAILURE;
+    }
+    struct epoll_event events[MAX_EVENTS];
+    while(!stop_flag){
+        int num_ready_fd = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        if(num_ready_fd == -1){
+            if(errno != EINTR){
+                perror("epoll_wait");
+            }
+        }
+        else if(num_ready_fd > 0){
+            for(int i=0; i<num_ready_fd; ++i){
+                if(events[i].data.fd == lis_fd){
+                    struct sockaddr_storage ss;
+                    socklen_t size = sizeof(ss);
+                    int client_fd = accept(lis_fd, (struct sockaddr*)&ss, &size);
+                    if(client_fd == -1){
+                        if(errno != EINTR){
+                            perror("accept");
+                        }
+                        continue;
+                    } 
+                    if(ss.ss_family == AF_INET){
+                        struct sockaddr_in *my_addr = (struct sockaddr_in*)&ss;
+                        inet_ntop(my_addr->sin_family, &my_addr->sin_addr.s_addr, my_buf, sizeof(my_buf)-1);
+                        printf("The ip address of the client is %s and the port number is %d\n", my_buf, my_addr->sin_port);
+                    }
+                    else if(ss.ss_family == AF_INET6){
+                        struct sockaddr_in6 *my6_addr = (struct sockaddr_in6*)&ss;
+                        inet_ntop(my6_addr->sin6_family, &my6_addr->sin6_addr.s6_addr, my_buf, sizeof(my_buf)-1);
+                        printf("The ip address of the client is %s and the port number is %d\n", my_buf, my6_addr->sin6_port);
+                    }
+                    set_non_block(client_fd);
+                    Connection *conn = (Connection*)malloc(sizeof(Connection));
+                    conn->fd = client_fd;
+                    conn->read_buf = NULL;
+                    conn->write_buf = NULL;
+                    conn->read_len = 0;
+                    conn->write_len = 0;
+                    struct epoll_event ev;
+                    ev.events = EPOLLIN;
+                    ev.data.ptr = conn;
+                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) == -1){
+                        perror("epoll_ctl");
+                        close(client_fd);
+                    }
+                }
+                else{
+                    Connection *conn = (Connection *)events[i].data.ptr;
+                    if(events[i].events & (EPOLLERR|EPOLLHUP)){
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                    }
+                    else if(events[i].events & EPOLLIN){
+                        ssize_t bytes_read = 0;
+                        int fd = conn->fd;
+                        if(conn->read_buf == NULL){
+                            bytes_read = read(fd, my_buf, HEADER_LEN);
+                            int len = 0;
+                            memcpy(&len, my_buf, HEADER_LEN);
+                            if(len <= MAX_MSG_LEN){
+                                bytes_read = read(fd, my_buf, MAX_MSG_LEN);
+                                if(bytes_read != MAX_MSG_LEN){
+                                    conn->read_buf = malloc(len);
+                                    memcpy(conn->read_buf, my_buf, bytes_read);
+                                    conn->read_len = bytes_read;
+                                }
+                                else{
+                                    events[i].events = EPOLLIN | EPOLLOUT;
+                                    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
+                                }
+                            }
+                        }
+                        else{
+                            bytes_read = read(fd, conn->read_buf + conn->read_len, sizeof(conn->read_buf)-conn->read_len);
+                            conn->read_len = conn->read_len + bytes_read;
+                            if(conn->read_len == sizeof(conn->read_buf)){
+                               events[i].events = EPOLLIN | EPOLLOUT;
+                               epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
+                               free(conn->read_buf);
+                               conn->read_buf = NULL;
+                               conn->read_len = 0;
+                            }
+                        }
+                    }
+                    else if(events[i].events & EPOLLOUT){
+                        ssize_t bytes_write = 0;
+                        int fd = conn->fd;
+                        if(conn->write_buf == NULL){
+                            const char *msg = "Hello World from server";
+                            int len = strlen(msg);
+                            memcpy(my_buf, &len, sizeof(int));
+                            memcpy(my_buf + HEADER_LEN, msg, len);
+                            bytes_write = write(fd, my_buf, HEADER_LEN + len);
+                            if(bytes_write != HEADER_LEN + len){
+                                conn->write_buf = malloc(HEADER_LEN + len);
+                                memcpy(conn->write_buf, my_buf, HEADER_LEN + len);
+                                conn->write_len = bytes_write;
+                            }
+                            else{
+                                events[i].events = EPOLLIN;
+                                epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
+                            }
+                        }
+                        else{
+                            bytes_write = write(fd, conn->write_buf + conn->write_len, sizeof(conn->write_buf)-conn->write_len);
+                            conn->write_len = conn->write_len + bytes_write;
+                            if(conn->write_len == sizeof(conn->write_buf)){
+                                events[i].events = EPOLLIN;
+                                epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
+                                free(conn->write_buf);
+                                conn->write_buf = NULL;
+                                conn->write_len = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close(epfd);
+    close(lis_fd);
+    return EXIT_SUCCESS;
+}
+    /*
     while(!stop_flag){
         struct sockaddr_storage ss;
         socklen_t size = sizeof(ss);
@@ -124,15 +288,7 @@ int main(void){
             buf[255] = '\0';
             fprintf(stdout, "The ip address of client is %s and port number is %d\n", buf, my_addr6->sin6_port);
         }
-        /*
-        int flags = fcntl(accept_fd, F_GETFL);
-        flags = flags | O_NONBLOCK;
-        if(fcntl(accept_fd, F_SETFL, flags) == -1){
-            perror("fcntl");
-            close(accept_fd);
-            continue;
-        }
-        */
+
         char read_buf[HEADER_LEN + MAX_MSG_LEN];
         char write_buf[HEADER_LEN + MAX_MSG_LEN];
         memset(read_buf, 0, sizeof(read_buf));
@@ -185,3 +341,4 @@ int main(void){
     close(lis_fd);
     return EXIT_SUCCESS;
 }
+*/
