@@ -20,11 +20,13 @@ const char *PORT = "3000";
 char my_buf[MAX_MSG_LEN];
 
 typedef struct Connection{
-    int fd;
     char *read_buf;
-    ssize_t read_len;
     char *write_buf;
-    ssize_t write_len;
+    size_t read_len;
+    size_t write_len;
+    ssize_t read_offset;
+    ssize_t write_offset;
+    int fd;
 }Connection;
 
 volatile sig_atomic_t stop_flag = 0;
@@ -179,6 +181,8 @@ int main(void){
                     conn->write_buf = NULL;
                     conn->read_len = 0;
                     conn->write_len = 0;
+                    conn->read_offset = 0;
+                    conn->write_offset = 0;
                     struct epoll_event ev;
                     ev.events = EPOLLIN;
                     ev.data.ptr = conn;
@@ -191,6 +195,7 @@ int main(void){
                     Connection *conn = (Connection *)events[i].data.ptr;
                     if(events[i].events & (EPOLLERR|EPOLLHUP)){
                         epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                        close(conn->fd);
                     }
                     else if(events[i].events & EPOLLIN){
                         ssize_t bytes_read = 0;
@@ -200,27 +205,31 @@ int main(void){
                             int len = 0;
                             memcpy(&len, my_buf, HEADER_LEN);
                             if(len <= MAX_MSG_LEN){
-                                bytes_read = read(fd, my_buf, MAX_MSG_LEN);
-                                if(bytes_read != MAX_MSG_LEN){
-                                    conn->read_buf = malloc(len);
+                                bytes_read = read(fd, my_buf, len);
+                                if(bytes_read != len){
+                                    conn->read_buf = (char*)malloc(len);
                                     memcpy(conn->read_buf, my_buf, bytes_read);
-                                    conn->read_len = bytes_read;
+                                    conn->read_len = len;
+                                    conn->read_offset = bytes_read;
                                 }
                                 else{
+                                    printf("From Client: %*.s\n", len, my_buf+HEADER_LEN);
                                     events[i].events = EPOLLIN | EPOLLOUT;
                                     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
                                 }
                             }
                         }
                         else{
-                            bytes_read = read(fd, conn->read_buf + conn->read_len, sizeof(conn->read_buf)-conn->read_len);
-                            conn->read_len = conn->read_len + bytes_read;
-                            if(conn->read_len == sizeof(conn->read_buf)){
+                            bytes_read = read(fd, conn->read_buf + conn->read_offset, conn->read_len-conn->read_offset);
+                            conn->read_offset = conn->read_offset + bytes_read;
+                            if(conn->read_len == conn->read_offset){
+                                printf("From Client: %*.s\n", conn->read_len, conn->read_buf+HEADER_LEN);
                                events[i].events = EPOLLIN | EPOLLOUT;
                                epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
                                free(conn->read_buf);
                                conn->read_buf = NULL;
                                conn->read_len = 0;
+                               conn->read_offset = 0;
                             }
                         }
                     }
@@ -234,9 +243,10 @@ int main(void){
                             memcpy(my_buf + HEADER_LEN, msg, len);
                             bytes_write = write(fd, my_buf, HEADER_LEN + len);
                             if(bytes_write != HEADER_LEN + len){
-                                conn->write_buf = malloc(HEADER_LEN + len);
+                                conn->write_buf = (char*)malloc(HEADER_LEN + len);
                                 memcpy(conn->write_buf, my_buf, HEADER_LEN + len);
-                                conn->write_len = bytes_write;
+                                conn->write_len = HEADER_LEN + len;
+                                conn->write_offset = bytes_write;
                             }
                             else{
                                 events[i].events = EPOLLIN;
@@ -244,14 +254,15 @@ int main(void){
                             }
                         }
                         else{
-                            bytes_write = write(fd, conn->write_buf + conn->write_len, sizeof(conn->write_buf)-conn->write_len);
-                            conn->write_len = conn->write_len + bytes_write;
-                            if(conn->write_len == sizeof(conn->write_buf)){
+                            bytes_write = write(fd, conn->write_buf + conn->write_offset, conn->write_len-conn->write_offset);
+                            conn->write_offset = conn->write_offset + bytes_write;
+                            if(conn->write_len == conn->write_offset){
                                 events[i].events = EPOLLIN;
                                 epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
                                 free(conn->write_buf);
                                 conn->write_buf = NULL;
                                 conn->write_len = 0;
+                                conn->write_offset = 0;
                             }
                         }
                     }
@@ -259,6 +270,7 @@ int main(void){
             }
         }
     }
+    printf("User press Ctrl-C to end the server\n");
     close(epfd);
     close(lis_fd);
     return EXIT_SUCCESS;
