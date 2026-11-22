@@ -17,7 +17,6 @@
 #define BACKLOG 10
 #define MAX_EVENTS 1024
 const char *PORT = "3000";
-char my_buf[MAX_MSG_LEN];
 
 typedef struct Connection{
     char *read_buf;
@@ -28,6 +27,8 @@ typedef struct Connection{
     ssize_t write_offset;
     int fd;
 }Connection;
+struct epoll_event events[MAX_EVENTS];
+int epfd = 0;
 
 volatile sig_atomic_t stop_flag = 0;
 
@@ -41,46 +42,119 @@ void handle_signal(int sig){
 void set_non_block(int fd){
     int flags = fcntl(fd, F_GETFL, 0);
     if(flags == -1){
-        perror("fcntl");
+        perror("fcntl:F_GETFL");
         exit(1);
     }
     flags = flags | O_NONBLOCK;
-    fcntl(fd, F_SETFL, flags);
+    if(fcntl(fd, F_SETFL, flags) == -1){
+        perror("fcntl:F_SETFL");
+        exit(1);
+    }
     return;
 }
 
-/*
-int read_message(int fd, char *buf, size_t size){
-    ssize_t num_read = 0;
-    errno = 0;
-    while(size > 0){
-        num_read = read(fd, buf, size);
-        if(num_read < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
-            return -1;
-        }
-        size = size - num_read;
-        buf = buf + num_read;
+void create_new_conn(int fd){
+    Connection *conn = (Connection*)malloc(sizeof(Connection));
+    conn->fd = fd;
+    conn->read_buf = NULL;
+    conn->write_buf = NULL;
+    conn->read_len = 0;
+    conn->write_len = 0;
+    conn->read_offset = 0;
+    conn->write_offset = 0;
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.ptr = conn;
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, conn->fd, &ev) == -1){
+        perror("epoll_ctl");
+        close(conn->fd);
+        free(conn);
     }
-    return 0;
+    return;
 }
 
-int write_message(int fd, const char *buf, size_t size){
-    ssize_t num_write = 0;
-while(size > 0){
-        num_write = write(fd, buf, size);
-        if(num_write < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
-            return -1;
+void handle_read(Connection *conn){
+    char my_buffer[4096];
+    ssize_t bytes_read = read(conn->fd, my_buffer, sizeof(my_buffer));
+    if(bytes_read <= 0 && errno != EINTR){
+        if(bytes_read == 0){
+            printf("connection closed by the client\n");
         }
-        size = size - num_write;
-        buf = buf + num_write;
+        else{
+            perror("read");
+        }
+        close(conn->fd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+        free(conn);
+        return;
     }
-    return 0;
+    if(conn->read_buf == NULL){
+        conn->read_buf = (char*)malloc(bytes_read);
+        memcpy(conn->read_buf, my_buffer, bytes_read);
+        conn->read_offset = bytes_read;
+    }
+    else{
+        conn->read_buf = (char*)realloc(conn->read_buf, conn->read_offset + bytes_read);
+        memcpy(conn->read_buf + conn->read_offset, my_buffer, bytes_read);
+        conn->read_offset = conn->read_offset + bytes_read;
+    }
+    if(conn->read_offset >= HEADER_LEN){
+        if(conn->read_len == 0){
+            int len = 0;
+            memcpy(&len, conn->read_buf, HEADER_LEN);
+            if(len >= MAX_MSG_LEN){
+                printf("Number of bytes send by the client: %d. Allowed number of bytes: %d. Client send more data then allowed\n", len, MAX_MSG_LEN);
+                return;
+            }
+            printf("length of payload: %d\n", len);
+        conn->read_len = len;
+        }
+        if(HEADER_LEN + conn->read_len >= conn->read_offset){
+            printf("data readed successfully\n");
+            // echoing back the data to the client
+            conn->write_buf = (char*)malloc(conn->read_len + HEADER_LEN);
+            memcpy(conn->write_buf, &conn->read_len, HEADER_LEN);
+            memcpy(conn->write_buf + HEADER_LEN, conn->read_buf + HEADER_LEN, conn->read_len);
+            conn->write_len = conn->read_len + HEADER_LEN;
+            free(conn->read_buf);
+            conn->read_buf = NULL;
+            conn->read_len = 0;
+            conn->read_offset = 0;
+            struct epoll_event ev;
+            ev.events = EPOLLOUT;
+            ev.data.ptr = conn;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
+        }
+    }
+    return;
 }
-*/
+
+void handle_write(Connection *conn){
+    if(conn->write_len > conn->write_offset){
+        ssize_t bytes_write = write(conn->fd, conn->write_buf + conn->write_offset, conn->write_len - conn->write_offset);
+        if(bytes_write < 0 && errno != EINTR){
+            perror("write");
+            close(conn->fd);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+            free(conn);
+        }
+        conn->write_offset = conn->write_offset + bytes_write;
+    }
+    else{
+        printf("data written successfully\n");
+        free(conn->write_buf);
+        conn->write_buf = NULL;
+        conn->write_offset = 0;
+        conn->write_len = 0;
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.ptr = conn;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
+    }
+    return;
+}
 
 int main(void){
-    memset(my_buf, 0, MAX_MSG_LEN);
-    my_buf[MAX_MSG_LEN-1] = '\0';
     struct sigaction sa;
     int status = 0;
     struct addrinfo a_info;
@@ -131,7 +205,7 @@ int main(void){
     sigaction(SIGTERM, &sa, NULL);
 
     // creating epoll instance
-    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    epfd = epoll_create1(EPOLL_CLOEXEC);
     if(epfd == -1){
         perror("epoll");
         return EXIT_FAILURE;
@@ -142,14 +216,17 @@ int main(void){
     ev.data.fd = lis_fd;
     if(epoll_ctl(epfd, EPOLL_CTL_ADD, lis_fd, &ev) == -1){
         perror("epoll_ctl");
+        close(epfd);
         return EXIT_FAILURE;
     }
-    struct epoll_event events[MAX_EVENTS];
     while(!stop_flag){
         int num_ready_fd = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if(num_ready_fd == -1){
             if(errno != EINTR){
                 perror("epoll_wait");
+                close(lis_fd);
+                close(epfd);
+                return EXIT_FAILURE;
             }
         }
         else if(num_ready_fd > 0){
@@ -163,108 +240,36 @@ int main(void){
                             perror("accept");
                         }
                         continue;
-                    } 
+                    }
+                    char my_buf[256];
                     if(ss.ss_family == AF_INET){
                         struct sockaddr_in *my_addr = (struct sockaddr_in*)&ss;
-                        inet_ntop(my_addr->sin_family, &my_addr->sin_addr.s_addr, my_buf, sizeof(my_buf)-1);
+                        inet_ntop(my_addr->sin_family, &my_addr->sin_addr.s_addr, my_buf, sizeof(my_buf));
                         printf("The ip address of the client is %s and the port number is %d\n", my_buf, my_addr->sin_port);
                     }
                     else if(ss.ss_family == AF_INET6){
                         struct sockaddr_in6 *my6_addr = (struct sockaddr_in6*)&ss;
-                        inet_ntop(my6_addr->sin6_family, &my6_addr->sin6_addr.s6_addr, my_buf, sizeof(my_buf)-1);
+                        inet_ntop(my6_addr->sin6_family, &my6_addr->sin6_addr.s6_addr, my_buf, sizeof(my_buf));
                         printf("The ip address of the client is %s and the port number is %d\n", my_buf, my6_addr->sin6_port);
                     }
                     set_non_block(client_fd);
-                    Connection *conn = (Connection*)malloc(sizeof(Connection));
-                    conn->fd = client_fd;
-                    conn->read_buf = NULL;
-                    conn->write_buf = NULL;
-                    conn->read_len = 0;
-                    conn->write_len = 0;
-                    conn->read_offset = 0;
-                    conn->write_offset = 0;
-                    struct epoll_event ev;
-                    ev.events = EPOLLIN;
-                    ev.data.ptr = conn;
-                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) == -1){
-                        perror("epoll_ctl");
-                        close(client_fd);
-                    }
+                    printf("making %d non-blocking\n", client_fd);
+                    create_new_conn(client_fd);
                 }
                 else{
                     Connection *conn = (Connection *)events[i].data.ptr;
                     if(events[i].events & (EPOLLERR|EPOLLHUP)){
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
                         close(conn->fd);
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                        free(conn);
                     }
                     else if(events[i].events & EPOLLIN){
-                        ssize_t bytes_read = 0;
-                        int fd = conn->fd;
-                        if(conn->read_buf == NULL){
-                            bytes_read = read(fd, my_buf, HEADER_LEN);
-                            int len = 0;
-                            memcpy(&len, my_buf, HEADER_LEN);
-                            if(len <= MAX_MSG_LEN){
-                                bytes_read = read(fd, my_buf, len);
-                                if(bytes_read != len){
-                                    conn->read_buf = (char*)malloc(len);
-                                    memcpy(conn->read_buf, my_buf, bytes_read);
-                                    conn->read_len = len;
-                                    conn->read_offset = bytes_read;
-                                }
-                                else{
-                                    printf("From Client: %*.s\n", len, my_buf+HEADER_LEN);
-                                    events[i].events = EPOLLIN | EPOLLOUT;
-                                    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
-                                }
-                            }
-                        }
-                        else{
-                            bytes_read = read(fd, conn->read_buf + conn->read_offset, conn->read_len-conn->read_offset);
-                            conn->read_offset = conn->read_offset + bytes_read;
-                            if(conn->read_len == conn->read_offset){
-                                printf("From Client: %*.s\n", conn->read_len, conn->read_buf+HEADER_LEN);
-                               events[i].events = EPOLLIN | EPOLLOUT;
-                               epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
-                               free(conn->read_buf);
-                               conn->read_buf = NULL;
-                               conn->read_len = 0;
-                               conn->read_offset = 0;
-                            }
-                        }
+                        printf("calling handle_read\n");
+                        handle_read(conn);
                     }
                     else if(events[i].events & EPOLLOUT){
-                        ssize_t bytes_write = 0;
-                        int fd = conn->fd;
-                        if(conn->write_buf == NULL){
-                            const char *msg = "Hello World from server";
-                            int len = strlen(msg);
-                            memcpy(my_buf, &len, sizeof(int));
-                            memcpy(my_buf + HEADER_LEN, msg, len);
-                            bytes_write = write(fd, my_buf, HEADER_LEN + len);
-                            if(bytes_write != HEADER_LEN + len){
-                                conn->write_buf = (char*)malloc(HEADER_LEN + len);
-                                memcpy(conn->write_buf, my_buf, HEADER_LEN + len);
-                                conn->write_len = HEADER_LEN + len;
-                                conn->write_offset = bytes_write;
-                            }
-                            else{
-                                events[i].events = EPOLLIN;
-                                epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
-                            }
-                        }
-                        else{
-                            bytes_write = write(fd, conn->write_buf + conn->write_offset, conn->write_len-conn->write_offset);
-                            conn->write_offset = conn->write_offset + bytes_write;
-                            if(conn->write_len == conn->write_offset){
-                                events[i].events = EPOLLIN;
-                                epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &events[i]);
-                                free(conn->write_buf);
-                                conn->write_buf = NULL;
-                                conn->write_len = 0;
-                                conn->write_offset = 0;
-                            }
-                        }
+                        printf("calling handle_write\n");
+                        handle_write(conn);           
                     }
                 }
             }
@@ -275,82 +280,3 @@ int main(void){
     close(lis_fd);
     return EXIT_SUCCESS;
 }
-    /*
-    while(!stop_flag){
-        struct sockaddr_storage ss;
-        socklen_t size = sizeof(ss);
-        int accept_fd = accept(lis_fd, (struct sockaddr*)&ss, &size);
-        if(accept_fd == -1){
-            if(errno != EINTR){
-                perror("accept");
-            }
-            continue;
-        }
-        char buf[256];
-        memset(buf, 0, sizeof(buf));
-        if(ss.ss_family == AF_INET){
-            struct sockaddr_in *my_addr = (struct sockaddr_in*)&ss;
-            inet_ntop(my_addr->sin_family, &my_addr->sin_addr.s_addr, buf, sizeof(buf)-1);
-            buf[255] = '\0';
-            fprintf(stdout, "The ip address of clinet is %s and port is %d\n", buf, my_addr->sin_port);
-        }
-        else if(ss.ss_family == AF_INET6){
-            struct sockaddr_in6 *my_addr6 = (struct sockaddr_in6*)&ss;
-            inet_ntop(my_addr6->sin6_family, &my_addr6->sin6_addr.s6_addr, buf, sizeof(buf)-1);
-            buf[255] = '\0';
-            fprintf(stdout, "The ip address of client is %s and port number is %d\n", buf, my_addr6->sin6_port);
-        }
-
-        char read_buf[HEADER_LEN + MAX_MSG_LEN];
-        char write_buf[HEADER_LEN + MAX_MSG_LEN];
-        memset(read_buf, 0, sizeof(read_buf));
-        memset(write_buf, 0, sizeof(write_buf));
-        int err_code = read_message(accept_fd, read_buf, HEADER_LEN);
-        if(err_code == -1){
-            if(errno == 0){
-                fprintf(stdout, "End of Connection\n");
-            }
-            else{
-                perror("read");
-            }
-            close(accept_fd);
-            return EXIT_FAILURE;
-        }
-        int msg_len = 0;
-        memcpy(&msg_len, read_buf, HEADER_LEN);
-        if(msg_len > MAX_MSG_LEN){
-            fprintf(stderr, "Message rceived from the client is too long\n");
-            close(accept_fd);
-        }
-        else{
-            err_code = 0;
-            err_code = read_message(accept_fd, read_buf + HEADER_LEN, msg_len);
-            if(err_code == -1){
-                perror("read");
-                close(accept_fd);
-            }
-            else{
-                fprintf(stdout, "data send by the client: %.*s\n", msg_len, read_buf + HEADER_LEN);
-            }
-        }
-        const char *msg = "Hello World from server";
-        msg_len = strlen(msg);
-        memcpy(write_buf, &msg_len, sizeof(int));
-        memcpy(write_buf + HEADER_LEN, msg, msg_len);
-        err_code = 0;
-        err_code = write_message(accept_fd, write_buf, sizeof(write_buf));
-        if(err_code == -1){
-            perror("write");
-            close(accept_fd);
-        }
-        //graceful shutdown
-        memset(read_buf, 0, sizeof(read_buf));
-        shutdown(accept_fd, SHUT_WR);
-        while(read(accept_fd, read_buf, sizeof(read_buf)-1) != 0);
-        close(accept_fd);
-    }
-    printf("user pressed Ctrl-C\n");
-    close(lis_fd);
-    return EXIT_SUCCESS;
-}
-*/
