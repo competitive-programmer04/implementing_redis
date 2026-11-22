@@ -109,7 +109,7 @@ void handle_read(Connection *conn){
             printf("length of payload: %d\n", len);
         conn->read_len = len;
         }
-        if(HEADER_LEN + conn->read_len >= conn->read_offset){
+        if(HEADER_LEN + conn->read_len == conn->read_offset){
             printf("data readed successfully\n");
             // echoing back the data to the client
             conn->write_buf = (char*)malloc(conn->read_len + HEADER_LEN);
