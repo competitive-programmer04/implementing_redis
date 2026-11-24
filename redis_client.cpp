@@ -61,42 +61,47 @@ int main(void){
     char write_buf[HEADER_LEN + MAX_MSG_LEN];
     memset(read_buf, 0, sizeof(read_buf));
     memset(write_buf, 0, sizeof(write_buf));
-    const char *msg = "Hello World from client";
-    int msg_len = strlen(msg);
-    memcpy(write_buf, &msg_len, sizeof(int));
-    memcpy(write_buf + HEADER_LEN, msg, msg_len);
-    int err_code = write_message(client_fd, write_buf, HEADER_LEN + msg_len);
-    if(err_code == -1){
-        perror("write");
-        close(client_fd);
-    }
-    err_code = 0;
-    err_code = read_message(client_fd, read_buf, HEADER_LEN);
-    if(err_code == -1){
-        if(errno == 0){
-            fprintf(stdout, "End of Connection\n");
+    const char *msg[] = {"Hello World one  from client", "Hello World two from client", "Hello World three from client"};
+    int num_elements = sizeof(msg)/sizeof(char*);
+    for(int i=0; i<num_elements; ++i){
+        int msg_len = strlen(msg[i]);
+        memcpy(write_buf, &msg_len, sizeof(int));
+        memcpy(write_buf + HEADER_LEN, msg[i], msg_len);
+        int err_code = write_message(client_fd, write_buf, HEADER_LEN + msg_len);
+        if(err_code == -1){
+            perror("write");
+            close(client_fd);
         }
-        else{
+    }
+    int err_code = 0;
+    for(int i=0; i<num_elements; ++i){
+        err_code = read_message(client_fd, read_buf, HEADER_LEN);
+        if(err_code == -1){
+            if(errno == 0){
+                fprintf(stdout, "End of Connection\n");
+            }
+            else{
+                perror("read");
+            }
+            close(client_fd);
+            return EXIT_FAILURE;
+        }
+        int msg_len = 0;
+        memcpy(&msg_len, read_buf, HEADER_LEN);
+        if(msg_len > MAX_MSG_LEN){
+            fprintf(stdout, "Message received from the server is too long\n");
+            close(client_fd);
+            return EXIT_FAILURE;
+        }
+        err_code = 0;
+        err_code = read_message(client_fd, read_buf + HEADER_LEN, msg_len);
+        if(err_code == -1){
             perror("read");
+            close(client_fd);
+            return EXIT_FAILURE;
         }
-        close(client_fd);
-        return EXIT_FAILURE;
+        fprintf(stdout, "data send by the server: %.*s\n", msg_len, read_buf + HEADER_LEN);
     }
-    msg_len = 0;
-    memcpy(&msg_len, read_buf, HEADER_LEN);
-    if(msg_len > MAX_MSG_LEN){
-        fprintf(stdout, "Message received from the server is too long\n");
-        close(client_fd);
-        return EXIT_FAILURE;
-    }
-    err_code = 0;
-    err_code = read_message(client_fd, read_buf + HEADER_LEN, msg_len);
-    if(err_code == -1){
-        perror("read");
-        close(client_fd);
-        return EXIT_FAILURE;
-    }
-    fprintf(stdout, "data send by the server: %.*s\n", msg_len, read_buf + HEADER_LEN);
     close(client_fd);
     return EXIT_SUCCESS;
 }
