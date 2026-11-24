@@ -73,12 +73,62 @@ void create_new_conn(int fd){
     return;
 }
 
-void parse_request(Connection *conn){
+int parse_request(Connection *conn){
     ssize_t start = 0;
     ssize_t end = conn->read_offset;
     while(1){
+        if(end - start >= HEADER_LEN && conn->read_len == 0){
+            int len = 0;
+            memcpy(&len, conn->read_buf, HEADER_LEN);
+            if(len > MAX_MSG_LEN){
+                printf("Number of bytes received from client: %d. Number of bytes allowed: %d. Client send too many bytes\n", len, MAX_MSG_LEN);
+                close(conn->fd);
+                epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                free(conn->read_buf);
+                free(conn->write_buf);
+                free(conn);
+                return -1;
+            }
+            conn->read_len = len;
+        }
+        if(conn->read_len > 0 && end - start >= conn->read_len + HEADER_LEN){
+            size_t total_len = HEADER_LEN + conn->read_len;
+            if(conn->write_buf == NULL){
+                conn->write_buf = (char*)malloc(total_len);
+                memcpy(conn->write_buf, conn->read_buf + start, HEADER_LEN);
+                memcpy(conn->write_buf + HEADER_LEN, conn->read_buf + start + HEADER_LEN, conn->read_len);
+            }
+            else{
+                conn->write_buf = (char*)realloc(conn->write_buf, conn->write_len + total_len);
+                memcpy(conn->write_buf + conn->write_len, conn->read_buf + start, HEADER_LEN);
+                memcpy(conn->write_buf + conn->write_len + HEADER_LEN, conn->read_buf + start + HEADER_LEN, conn->read_len);
+            }
+            conn->write_len = conn->write_len + total_len;
+            start = start + conn->read_len + HEADER_LEN;
+            conn->read_len = 0;
+        }
+        else{
+            break;
+        }
     }
-    return;
+    if(conn->write_len > 0){
+        if(end - start == 0){
+            free(conn->read_buf);
+            conn->read_buf = NULL;
+            conn->read_len = 0;
+            conn->read_offset = 0;
+        }
+        else{
+            int extra_bytes = end - start;
+            char *extra_buf = (char*)malloc(extra_bytes);
+            memcpy(extra_buf, conn->read_buf + start, extra_bytes);
+            printf("freeing old data \n");
+            free(conn->read_buf);
+            conn->read_buf = extra_buf;
+            conn->read_offset = extra_bytes;
+        }
+    }
+    return 0;
 }
 
 void handle_read(Connection *conn){
@@ -111,70 +161,34 @@ void handle_read(Connection *conn){
             memcpy(conn->read_buf + conn->read_offset, my_buffer, bytes_read);
             conn->read_offset = conn->read_offset + bytes_read;
         }
-        if(conn->read_offset >= HEADER_LEN){
-            if(conn->read_len == 0){
-                int len = 0;
-                memcpy(&len, conn->read_buf, HEADER_LEN);
-                if(len >= MAX_MSG_LEN){
-                    printf("Number of bytes send by the client: %d. Allowed number of bytes: %d. Client send more data then allowed\n", len, MAX_MSG_LEN);
-                    free(conn->read_buf);
-                    conn->read_buf = NULL;
-                    conn->read_len = 0;
-                    conn->read_offset = 0;
-                    return;
-                }
-                printf("length of payload: %d\n", len);
-                conn->read_len = len;
+        int status_code = parse_request(conn);
+        if(status_code == -1) return;
+        if(conn->write_len > 0){
+            ssize_t bytes_write = write(conn->fd, conn->write_buf + conn->write_offset, conn->write_len);
+            if(bytes_write == conn->write_len){
+                free(conn->write_buf);
+                conn->write_buf = 0;
+                conn->write_len = 0;
+                conn->write_offset = 0;
             }
-            if(conn->read_offset >= conn->read_len + HEADER_LEN){
-                printf("data readed successfully\n");
-                // echoing back the data to the client
-                conn->write_buf = (char*)malloc(conn->read_len + HEADER_LEN);
-                memcpy(conn->write_buf, &conn->read_len, HEADER_LEN);
-                memcpy(conn->write_buf + HEADER_LEN, conn->read_buf + HEADER_LEN, conn->read_len);
-                conn->write_len = conn->read_len + HEADER_LEN;
-                if(conn->read_offset > conn->write_len){
-                    size_t extra_bytes = conn->read_offset - conn->write_len;
-                    char *extra_buf = (char*)malloc(extra_bytes);
-                    memcpy(extra_buf, conn->read_buf+conn->write_len, extra_bytes);
-                    free(conn->read_buf);
-                    conn->read_buf = extra_buf; 
-                    conn->read_offset = extra_bytes;
-                    conn->read_len = 0;
-
-                }
-                else{
-                    free(conn->read_buf);
-                    conn->read_buf = NULL;
-                    conn->read_len = 0;
-                    conn->read_offset = 0;
-                }
-                ssize_t bytes_write = write(conn->fd, conn->write_buf, conn->write_len);
-                if(bytes_write == conn->write_len){
-                    free(conn->write_buf);
-                    conn->write_buf = NULL;
-                    conn->write_len = 0;
-                    conn->write_offset = 0;
-                }
-                else{
-                    if(bytes_write < 0){
-                        if(errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
-                            perror("write");
-                            close(conn->fd);
-                            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
-                            free(conn->write_buf);
-                            free(conn);
-                            return;
-                        }
+            else{
+                if(bytes_write < 0){
+                    if(errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
+                        perror("write");
+                        close(conn->fd);
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                        free(conn->read_buf);
+                        free(conn->write_buf);
+                        return;
                     }
-                    else{
-                        conn->write_offset = conn->write_offset + bytes_write;
-                    }
-                    struct epoll_event ev;
-                    ev.events = EPOLLIN|EPOLLOUT;
-                    ev.data.ptr = conn;
-                    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
                 }
+                else if(bytes_write > 0){
+                    conn->write_offset = conn->write_offset + bytes_write;
+                }
+                struct epoll_event ev;
+                ev.events = EPOLLIN | EPOLLOUT;
+                ev.data.ptr = conn;
+                epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
             }
         }
     }

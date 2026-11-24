@@ -61,7 +61,20 @@ int main(void){
     char write_buf[HEADER_LEN + MAX_MSG_LEN];
     memset(read_buf, 0, sizeof(read_buf));
     memset(write_buf, 0, sizeof(write_buf));
-    const char *msg[] = {"Hello World one  from client", "Hello World two from client", "Hello World three from client"};
+
+    // Testing request-response pipelining
+    char *line = NULL;
+    FILE *fp = fopen("redis_server.cpp", "r");
+    if(fp == NULL){
+        perror("fopen");
+    }
+    else if(fp != NULL){
+        size_t line_len = 0;
+        ssize_t bytes_read = 0;
+        while((bytes_read = getline(&line, &line_len, fp)) != -1);
+    }
+
+    const char *msg[]  = {"Hello World one from client", "Hello World two from client", "Hello World three from client", line, "Hello World five from client"};
     int num_elements = sizeof(msg)/sizeof(char*);
     for(int i=0; i<num_elements; ++i){
         int msg_len = strlen(msg[i]);
