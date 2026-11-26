@@ -12,8 +12,8 @@
 #include<signal.h>
 #include<sys/epoll.h>
 
-#define MAX_MSG_LEN 4096
-#define HEADER_LEN 4
+#define MAX_MSG_LEN (1<<12)
+#define HEADER_LEN (sizeof(int))
 #define BACKLOG 10
 #define MAX_EVENTS 1024
 const char *PORT = "3000";
@@ -77,16 +77,11 @@ int parse_request(Connection *conn){
     ssize_t start = 0;
     ssize_t end = conn->read_offset;
     while(1){
+        int len = 0;
         if(end - start >= HEADER_LEN && conn->read_len == 0){
-            int len = 0;
-            memcpy(&len, conn->read_buf, HEADER_LEN);
+            memcpy(&len, conn->read_buf + start, HEADER_LEN);
             if(len > MAX_MSG_LEN){
                 printf("Number of bytes received from client: %d. Number of bytes allowed: %d. Client send too many bytes\n", len, MAX_MSG_LEN);
-                close(conn->fd);
-                epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
-                free(conn->read_buf);
-                free(conn->write_buf);
-                free(conn);
                 return -1;
             }
             conn->read_len = len;
@@ -95,12 +90,12 @@ int parse_request(Connection *conn){
             size_t total_len = HEADER_LEN + conn->read_len;
             if(conn->write_buf == NULL){
                 conn->write_buf = (char*)malloc(total_len);
-                memcpy(conn->write_buf, conn->read_buf + start, HEADER_LEN);
+                memcpy(conn->write_buf, &len, HEADER_LEN);
                 memcpy(conn->write_buf + HEADER_LEN, conn->read_buf + start + HEADER_LEN, conn->read_len);
             }
             else{
                 conn->write_buf = (char*)realloc(conn->write_buf, conn->write_len + total_len);
-                memcpy(conn->write_buf + conn->write_len, conn->read_buf + start, HEADER_LEN);
+                memcpy(conn->write_buf + conn->write_len, &len, HEADER_LEN);
                 memcpy(conn->write_buf + conn->write_len + HEADER_LEN, conn->read_buf + start + HEADER_LEN, conn->read_len);
             }
             conn->write_len = conn->write_len + total_len;
@@ -113,6 +108,7 @@ int parse_request(Connection *conn){
     }
     if(conn->write_len > 0){
         if(end - start == 0){
+            printf("freeing read buffer\n");
             free(conn->read_buf);
             conn->read_buf = NULL;
             conn->read_len = 0;
@@ -131,25 +127,23 @@ int parse_request(Connection *conn){
     return 0;
 }
 
-void handle_read(Connection *conn){
+int handle_read(Connection *conn){
     char my_buffer[4096];
     while(1){
         ssize_t bytes_read = read(conn->fd, my_buffer, sizeof(my_buffer));
         if(bytes_read <= 0 && errno != EINTR){
             if(bytes_read == 0){
                 printf("connection closed by the client\n");
+                return -1;
             }
             else{
                 if(errno == EAGAIN || errno == EWOULDBLOCK){
                     printf("recive buffer is empty. We read all the client's request\n");
-                    return; // receive buffer is empty. We read all the requests data
+                    return 0; // receive buffer is empty. We read all the requests data
                 }
                 perror("read");
             }
-            close(conn->fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
-            free(conn);
-            return;
+            return -1;
         }
         if(conn->read_buf == NULL){
             conn->read_buf = (char*)malloc(bytes_read);
@@ -162,10 +156,11 @@ void handle_read(Connection *conn){
             conn->read_offset = conn->read_offset + bytes_read;
         }
         int status_code = parse_request(conn);
-        if(status_code == -1) return;
+        if(status_code == -1) return -1;
         if(conn->write_len > 0){
-            ssize_t bytes_write = write(conn->fd, conn->write_buf + conn->write_offset, conn->write_len);
-            if(bytes_write == conn->write_len){
+            ssize_t bytes_write = write(conn->fd, conn->write_buf + conn->write_offset, conn->write_len - conn->write_offset);
+            if(bytes_write == conn->write_len - conn->write_offset){
+                printf("write done\n");
                 free(conn->write_buf);
                 conn->write_buf = 0;
                 conn->write_len = 0;
@@ -173,16 +168,17 @@ void handle_read(Connection *conn){
             }
             else{
                 if(bytes_write < 0){
+                    if(errno == ECONNRESET || errno == EPIPE){
+                        printf("handling sigpipe: Connection closed by the client\n");
+                        return -1;
+                    }
                     if(errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
                         perror("write");
-                        close(conn->fd);
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
-                        free(conn->read_buf);
-                        free(conn->write_buf);
-                        return;
+                        return -1;
                     }
                 }
                 else if(bytes_write > 0){
+                    printf("partial write\n");
                     conn->write_offset = conn->write_offset + bytes_write;
                 }
                 struct epoll_event ev;
@@ -192,22 +188,22 @@ void handle_read(Connection *conn){
             }
         }
     }
-    return;
+    return 0;
 }
 
-void handle_write(Connection *conn){
+int handle_write(Connection *conn){
     while(conn->write_len > conn->write_offset){
         ssize_t bytes_write = write(conn->fd, conn->write_buf + conn->write_offset, conn->write_len - conn->write_offset);
         if(bytes_write < 0){
-            if(errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK){
-                perror("write");
-                close(conn->fd);
-                epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
-                free(conn->read_buf);
-                free(conn->write_buf);
-                free(conn);
+            if(errno == ECONNRESET || errno == EPIPE){
+                printf("handling sigpipe: Connection closed by the client\n");
+                return -1;
             }
-            return;
+            if(errno == EINTR || errno == EAGAIN || errno != EWOULDBLOCK){
+                return 0;
+            }
+            perror("write");
+            return -1;
         }
         conn->write_offset = conn->write_offset + bytes_write;
     }
@@ -220,7 +216,7 @@ void handle_write(Connection *conn){
     ev.events = EPOLLIN;
     ev.data.ptr = conn;
     epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
-    return;
+    return 0;
 }
 
 int main(void){
@@ -269,9 +265,10 @@ int main(void){
     sa.sa_handler = handle_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    // Register handle for both Ctrl-C and termination request
+    // Register handle for Ctrl-C and termination request and sigpipe
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGPIPE, &sa, NULL);
 
     // creating epoll instance
     epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -322,7 +319,7 @@ int main(void){
                         printf("The ip address of the client is %s and the port number is %d\n", my_buf, my6_addr->sin6_port);
                     }
                     set_non_block(client_fd);
-                    printf("making %d non-blocking\n", client_fd);
+                    printf("making fd %d non-blocking\n", client_fd);
                     create_new_conn(client_fd);
                 }
                 else{
@@ -330,15 +327,34 @@ int main(void){
                     if(events[i].events & (EPOLLERR|EPOLLHUP)){
                         close(conn->fd);
                         epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                        free(conn->read_buf);
+                        free(conn->write_buf);
                         free(conn);
+                        continue;
                     }
-                    else if(events[i].events & EPOLLIN){
+                    if(events[i].events & EPOLLIN){
                         printf("calling handle_read\n");
-                        handle_read(conn);
+                        int result = handle_read(conn);
+                        if(result == -1){
+                            close(conn->fd);
+                            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                            free(conn->read_buf);
+                            free(conn->write_buf);
+                            free(conn);
+                            continue;
+                        }
                     }
-                    else if(events[i].events & EPOLLOUT){
+                    if(events[i].events & EPOLLOUT){
                         printf("calling handle_write\n");
-                        handle_write(conn);           
+                        int result = handle_write(conn);
+                        if(result == -1){
+                            close(conn->fd);
+                            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                            free(conn->read_buf);
+                            free(conn->write_buf);
+                            free(conn);
+                            continue;
+                        }
                     }
                 }
             }
