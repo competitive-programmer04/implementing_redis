@@ -199,7 +199,7 @@ int handle_write(Connection *conn){
                 printf("handling sigpipe: Connection closed by the client\n");
                 return -1;
             }
-            if(errno == EINTR || errno == EAGAIN || errno != EWOULDBLOCK){
+            if(errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK){
                 return 0;
             }
             perror("write");
